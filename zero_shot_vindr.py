@@ -12,6 +12,7 @@ import pandas as pd
 from PIL import Image
 
 import torch
+from sklearn.metrics import roc_auc_score, f1_score
 from torch.utils import data
 from tqdm import tqdm
 
@@ -289,6 +290,148 @@ def write_outputs(out_dir: Path, y_true: np.ndarray, scores: np.ndarray, label_n
     (out_dir / "run_meta.json").write_text(json.dumps(meta, indent=2) + "\n")
 
 
+def compute_map_at_k(y_true, scores, k=10):
+    y_true = np.asarray(y_true)
+    scores = np.asarray(scores)
+    N, L = y_true.shape
+    ap_list = []
+
+    for i in range(N):
+        y = y_true[i]
+        s = scores[i]
+        pos_idx = np.where(y == 1)[0]
+        if len(pos_idx) == 0:
+            continue
+
+        order = np.argsort(-s)      # descending
+        topk = order[:k]
+
+        hits = 0
+        precisions = []
+        for rank, idx in enumerate(topk, start=1):
+            if y[idx] == 1:
+                hits += 1
+                precisions.append(hits / rank)
+
+        if len(precisions) == 0:
+            ap = 0.0
+        else:
+            denom = min(len(pos_idx), k)
+            ap = float(np.sum(precisions) / denom)
+        ap_list.append(ap)
+
+    if len(ap_list) == 0:
+        return None
+    return float(np.mean(ap_list))
+
+
+def compute_classification_metrics(y_true, scores, label_names, threshold=0.5):
+    y_true = np.asarray(y_true)
+    scores = np.asarray(scores)
+    N, L = y_true.shape
+    assert scores.shape == (N, L)
+
+    metrics = {}
+
+    # ----- ROC–AUC -----
+    per_label_auc = {}
+    auc_values = []
+    for j, label in enumerate(label_names):
+        y = y_true[:, j]
+        if len(np.unique(y)) < 2:
+            per_label_auc[label] = None
+            continue
+        try:
+            auc = roc_auc_score(y, scores[:, j])
+            per_label_auc[label] = float(auc)
+            auc_values.append(auc)
+        except ValueError:
+            per_label_auc[label] = None
+
+    metrics["per_label_auc"] = per_label_auc
+    metrics["macro_auc"] = float(np.mean(auc_values)) if len(auc_values) > 0 else None
+
+    # micro-AUC
+    try:
+        metrics["micro_auc"] = float(roc_auc_score(y_true.ravel(), scores.ravel()))
+    except ValueError:
+        metrics["micro_auc"] = None
+
+    # ----- F1 (global threshold) -----
+    y_pred = (scores >= threshold).astype(int)
+
+    per_label_f1 = {}
+    f1_values = []
+    for j, label in enumerate(label_names):
+        y = y_true[:, j]
+        y_hat = y_pred[:, j]
+        if len(np.unique(y)) < 2:
+            per_label_f1[label] = None
+            continue
+        f1 = f1_score(y, y_hat)
+        per_label_f1[label] = float(f1)
+        f1_values.append(f1)
+
+    metrics["per_label_f1"] = per_label_f1
+    metrics["macro_f1"] = float(np.mean(f1_values)) if len(f1_values) > 0 else None
+    metrics["micro_f1"] = float(f1_score(y_true.ravel(), y_pred.ravel()))
+
+    # ----- mAP@10 -----
+    metrics["map_at_10"] = compute_map_at_k(y_true, scores, k=10)
+
+    return metrics
+
+
+# ==========================
+# Saving helpers
+# ==========================
+
+def save_scores_npz(out_path: Path,
+                    image_ids: list,
+                    label_names: list,
+                    scores: np.ndarray,
+                    y_true: np.ndarray = None):
+    """
+    Compact, fast load for downstream:
+      - image_ids (N,)
+      - label_names (L,)
+      - scores (N,L)
+      - y_true (optional) (N,L)
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "image_ids": np.asarray(image_ids, dtype=object),
+        "label_names": np.asarray(label_names, dtype=object),
+        "scores": np.asarray(scores, dtype=np.float32),
+    }
+    if y_true is not None:
+        payload["y_true"] = np.asarray(y_true, dtype=np.float32)
+    np.savez_compressed(out_path, **payload)
+    print(f"[Output] Saved per-image scores (npz): {out_path}")
+
+
+def save_scores_csv(out_path: Path,
+                    image_ids: list,
+                    label_names: list,
+                    scores: np.ndarray,
+                    y_true: np.ndarray = None):
+    """
+    Human-readable wide CSV:
+      columns: image_id, score::<label_1>, ..., score::<label_L>
+      optionally also y::<label> columns.
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame(scores, columns=[f"score::{lb}" for lb in label_names])
+    df.insert(0, "image_id", image_ids)
+
+    if y_true is not None:
+        ydf = pd.DataFrame(y_true, columns=[f"y::{lb}" for lb in label_names])
+        df = pd.concat([df, ydf], axis=1)
+
+    df.to_csv(out_path, index=False)
+    print(f"[Output] Saved per-image scores (csv): {out_path}")
+
+
 def main():
     import argparse
 
@@ -464,6 +607,52 @@ def main():
     print(f"[Done] Wrote outputs to: {out_dir}")
     print(f"       y_true.npy shape={y_true_all.shape}")
     print(f"       scores.npy shape={scores_avg.shape}")
+
+    cls_metrics = compute_classification_metrics(
+        y_true=y_true_all,
+        scores=scores_avg,
+        label_names=label_names,
+        threshold=0.5,
+    )
+
+    ckpt_name = "ensemble"
+
+    results = {
+        "checkpoint": ckpt_name,
+        "num_images": int(scores_avg.shape[0]),
+        "label_names": list(label_names),
+        "classification": cls_metrics,
+        "threshold": 0.5,
+        "scores_file_npz": None,
+        "scores_file_csv": None,
+    }
+
+    scores_npz_path = out_dir / f"vindr_zero_shot_scores_{ckpt_name}.npz"
+    save_scores_npz(
+        out_path=scores_npz_path,
+        image_ids=image_ids_all,
+        label_names=label_names,
+        scores=scores_avg,
+        y_true=y_true_all,
+    )
+    results["scores_file_npz"] = str(scores_npz_path)
+
+    scores_csv_path = out_dir / f"vindr_zero_shot_scores_{ckpt_name}.csv"
+    save_scores_csv(
+        out_path=scores_csv_path,
+        image_ids=image_ids_all,
+        label_names=label_names,
+        scores=scores_avg,
+        y_true=y_true_all,
+    )
+    results["scores_file_csv"] = str(scores_csv_path)
+
+    # ---- Save JSON metrics ----
+    out_path = out_dir / f"vindr_zero_shot_{ckpt_name}.json"
+    with open(out_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"[Output] Saved metrics to: {out_path}")
+
 
 
 if __name__ == "__main__":
