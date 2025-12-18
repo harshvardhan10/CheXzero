@@ -219,6 +219,39 @@ def infer_one_checkpoint(
     return run_softmax_eval(model, loader, labels, pair_template, device=device, context_length=context_length)
 
 
+def resolve_checkpoint_paths(
+    model_paths_or_dirs: List[str],
+    exts: tuple = (".pt", ".pth", ".bin"),
+    recursive: bool = False,
+) -> List[str]:
+    """
+    Accepts a list that may contain checkpoint files and/or directories.
+    Directories are expanded into checkpoint files (by extension).
+    """
+    out: List[Path] = []
+
+    for item in model_paths_or_dirs:
+        p = Path(item)
+
+        if p.is_dir():
+            globber = p.rglob if recursive else p.glob
+            for ext in exts:
+                out.extend(globber(f"*{ext}"))
+        elif p.is_file():
+            out.append(p)
+        else:
+            raise FileNotFoundError(f"Checkpoint path not found: {p}")
+
+    # de-dup + stable sort
+    uniq = sorted({str(p.resolve()) for p in out})
+    if len(uniq) == 0:
+        raise FileNotFoundError(
+            f"No checkpoints found. Inputs={model_paths_or_dirs}, "
+            f"exts={exts}, recursive={recursive}"
+        )
+    return uniq
+
+
 def ensemble_models_vindr_png(
     model_paths: List[str],
     image_dir: str,
@@ -232,13 +265,23 @@ def ensemble_models_vindr_png(
     batch_size: int = 64,
     num_workers: int = 4,
     device: Optional[str] = None,
+    ckpt_exts: Tuple[str, ...] = (".pt", ".pth", ".bin"),
+    ckpt_recursive: bool = False
 ) -> Tuple[List[np.ndarray], np.ndarray]:
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     device_t = torch.device(device)
 
+    # NEW: expand directories to checkpoint files
+    model_paths = resolve_checkpoint_paths(
+        model_paths_or_dirs=model_paths,
+        exts=ckpt_exts,
+        recursive=ckpt_recursive,
+    )
     model_paths = sorted(model_paths)
+    print(f"[Info] Using {len(model_paths)} checkpoints")
+
     predictions = []
 
     _, loader = build_loader(
@@ -461,7 +504,7 @@ def main():
 
     ap.add_argument("--cache_dir", type=str, default=None)
     ap.add_argument("--save_name", type=str, default="vindr")
-    ap.add_argument("--out_dir", type=str, default="vindr_outputs")
+    ap.add_argument("--out_dir", type=str, default="vindr_results")
 
     # Smoke test
     ap.add_argument("--smoke_test", action="store_true", help="Run a small-subset single-checkpoint test and exit.")
