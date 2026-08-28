@@ -273,7 +273,7 @@ def ensemble_models_vindr_png(
         device = "cuda" if torch.cuda.is_available() else "cpu"
     device_t = torch.device(device)
 
-    # NEW: expand directories to checkpoint files
+    # expand directories to checkpoint files
     model_paths = resolve_checkpoint_paths(
         model_paths_or_dirs=model_paths,
         exts=ckpt_exts,
@@ -658,7 +658,7 @@ def main():
         threshold=0.5,
     )
 
-    ckpt_name = "ensemble"
+    ckpt_name = "ensemble"  #TODO: handle this better so that a sub dir is created inside vindr_results out_dir
 
     results = {
         "checkpoint": ckpt_name,
